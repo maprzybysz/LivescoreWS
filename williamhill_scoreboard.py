@@ -1,8 +1,71 @@
+"""
+williamhill_scoreboard.py
+─────────────────────────
+Skrobak live scoreboard dla William Hill (sports.whcdn.net).
+
+Przegląd protokołu
+──────────────────
+Strona używa Diffusion — własnościowego protokołu pub/sub po WebSocket.
+Wszystkie wiadomości to ramki binarne z 1-bajtowym prefiksem typu:
+
+  0x00  Ping od serwera   → musimy odpowiedzieć pongiem 0x06 (ten sam
+                            payload, pierwszy bajt zmieniony na 0x06).
+                            Brak odpowiedzi powoduje zamknięcie połączenia
+                            przez serwer po ~30 s — to jest źródło
+                            reconnectów widocznych w logach.
+  0x01  Topic load ACK    → odsyłamy bez zmian (handshake protokołu)
+  0x02  Subscribe ACK     → ignorujemy
+  0x03  Unsubscribe ACK   → ignorujemy
+  0x04  Topic snapshot    → pełny payload CBOR ze stanem meczu i nazwami
+                            drużyn; przychodzi raz po każdej subskrypcji
+  0x05  Topic delta       → przyrostowa aktualizacja CBOR (eventy, statsy,
+                            zegar)
+  0x06  Keepalive / pong  → wysyłamy co 20 s i jako odpowiedź na ping
+
+Subskrybowane tematy
+────────────────────
+  scoreboards/v1/OB_EV{id}            – stan meczu (wynik, statsy, zegar)
+  scoreboards/v1/OB_EV{id}/incidents  – indywidualne eventy meczowe z
+                                        polami teamType (HOME/AWAY) i type
+
+Nazwy drużyn
+────────────
+Nazwy drużyn NIE ma w ramkach delta (0x05). Przychodzą w pierwszym
+snapshocie (0x04) pod kluczem "name" jako "Gospodarz vs Gość", albo
+zagnieżdżone pod homeTeam.name / awayTeam.name. Parsujemy je raz
+i cachujemy na cały czas życia procesu.
+
+Parsowanie eventów
+──────────────────
+Eventy przychodzą w dwóch wariantach:
+  a) Pełne CBOR  – dekodowane przez cbor2; pola "type" i "teamType"
+                   wyciągane przez deep_find().
+  b) Binarne     – brak poprawnej struktury CBOR; fallback do skanowania
+                   surowych bajtów w poszukiwaniu znanych ciągów ASCII
+                   (typy eventów) i markerów HOME/AWAY.
+
+Ramki bez typu eventu i bez drużyny są ciche odrzucane — to delta
+pozycji/pędu bez wartości wyświetleniowej.
+Ramki z drużyną ale bez typu eventu pokazywane są jako STAT_UPDATE.
+
+Deduplikacja
+────────────
+Eventy zegarowe (FIRST_HALF, SECOND_HALF itp.) przychodzą jako
+ciągły strumień identycznych delt podczas gdy zegar tyka. Wyświetlamy
+tylko pierwsze wystąpienie przy każdej zmianie okresu.
+
+Reconnect
+─────────
+Serwer zamyka połączenie co kilka minut. Automatycznie się
+łączymy ponownie i pokazujemy linię RECONNECTING / RECONNECTED
+w tabeli eventów. Po reconneccie serwer wysyła ponownie pełny
+snapshot, więc nazwy drużyn i aktualny stan meczu są zawsze świeże.
+"""
+
 import asyncio
 import base64
 import io
 import os
-import re
 import ssl
 import argparse
 from datetime import datetime
@@ -14,12 +77,16 @@ import websockets
 # KONFIGURACJA
 # ─────────────────────────────────────────────────────────────────
 
+# Endpoint WebSocket Diffusion — parametry query identyfikują typ klienta
+# i ustawiają timeout reconnectu po stronie serwera (r=300000 ms = 5 min).
 WS_URL = (
     "wss://scoreboards-push.williamhill.com/diffusion"
     "?ty=WB&v=18&ca=8&r=300000"
     "&sp=%7B%22src%22%3A%22traf_sb_football%22"
     "%2C%22origin%22%3A%22https%3A%2F%2Fsports.whcdn.net%22%7D"
 )
+
+# Nagłówki udające prawdziwą przeglądarkę — serwer sprawdza Origin.
 HEADERS = {
     "Origin":     "https://sports.whcdn.net",
     "User-Agent": (
@@ -28,11 +95,16 @@ HEADERS = {
         "Chrome/146.0.0.0 Safari/537.36"
     ),
 }
+
+# Początkowa ramka handshake Diffusion (zakodowana base64).
+# Po zdekodowaniu zawiera stały nagłówek protokołu, którego serwer
+# oczekuje przed akceptacją jakichkolwiek subskrypcji.
 HANDSHAKE_B64 = (
     "AHUBFT5zY29yZWJvYXJkcy92MS9lcG9jaAAAgIAQAQD"
     "/////B/////8H/////wf/////BwA="
 )
 
+# Czytelne etykiety dla identyfikatorów okresów używanych w payloadach CBOR.
 PERIOD_LABELS = {
     "FIRST_HALF":  "1st Half",
     "SECOND_HALF": "2nd Half",
@@ -43,6 +115,9 @@ PERIOD_LABELS = {
     "PENALTIES":   "Penalties",
 }
 
+# Wszystkie znane typy eventów, posortowane od najdłuższego — skaner
+# bajtów dopasowuje wtedy najbardziej szczegółowy ciąg jako pierwszy
+# (np. DANGEROUS_FREE_KICK przed FREE_KICK).
 EVENT_TYPES_LIST = sorted([
     "GOAL", "YELLOW", "RED_CARD",
     "FREE_KICK", "DANGEROUS_FREE_KICK",
@@ -57,6 +132,8 @@ EVENT_TYPES_LIST = sorted([
     "FIRST_HALF", "SECOND_HALF",
 ], key=len, reverse=True)
 
+# Eventy dotyczące całego meczu, nie konkretnej drużyny.
+# Wyświetlane bez kolumny drużyny.
 NO_TEAM_EVENTS = {
     "HALF_TIME", "FULL_TIME", "GAME_FINISHED", "STOP_GAME",
     "STOP_1_ST_HALF", "STOP_2_ND_HALF",
@@ -64,26 +141,64 @@ NO_TEAM_EVENTS = {
     "BALL_SAFE",
 }
 
-GAME_OVER_EVENTS = {"GAME_FINISHED", "STOP_GAME", "FULL_TIME"}
+# Otrzymanie któregokolwiek z tych eventów oznacza koniec meczu.
+# STOP_2_ND_HALF to sygnał końca drugiej połowy używany w niektórych
+# ligach zamiast FULL_TIME / GAME_FINISHED.
+GAME_OVER_EVENTS = {"GAME_FINISHED", "STOP_GAME", "FULL_TIME", "STOP_2_ND_HALF"}
+
+# Eventy zegarowe przychodzą jako ciągły strumień identycznych delt
+# podczas gdy zegar tyka. Deduplikujemy — wyświetlamy tylko raz
+# przy każdej zmianie okresu.
+CLOCK_EVENTS = {"FIRST_HALF", "SECOND_HALF", "HALF_TIME", "FULL_TIME"}
+
+# Szerokość kolumny TEAM w tabeli wyjściowej.
+COL_TEAM_WIDTH = 22
 
 # ─────────────────────────────────────────────────────────────────
-# SUBSCRIBE / KEEPALIVE
+# PROTOKÓŁ — BUDOWANIE RAMEK
 # ─────────────────────────────────────────────────────────────────
 
 def make_subscribe(topic: str) -> bytes:
+    """
+    Buduje ramkę SUBSCRIBE protokołu Diffusion dla podanej ścieżki tematu.
+    Układ ramki:  00 03 02 <len> 3E <topic_bytes>
+      00 03 02  = nagłówek komendy subscribe
+      3E        = '>' prefix selektora (dopasowanie ścieżki tematu)
+    """
     topic_b  = topic.encode("utf-8")
     selector = bytes([0x3E]) + topic_b
     return bytes([0x00, 0x03, 0x02, len(selector)]) + selector
 
 
 def make_keepalive() -> bytes:
+    """
+    Ramka keepalive wysyłana przez klienta co 20 s.
+    Format: 06 <3 losowe bajty> 2B
+    Losowe bajty zapobiegają traktowaniu powtarzających się ramek
+    jako duplikatów i ich odrzucaniu przez serwer.
+    """
     return bytes([0x06]) + os.urandom(3) + bytes([0x2b])
 
+
+def make_pong(ping_raw: bytes) -> bytes:
+    """
+    Odpowiedź na ping serwera (ramka 0x00).
+    Pong jest identyczny z pingiem, ale z pierwszym bajtem zmienionym
+    na 0x06. Brak odpowiedzi powoduje rozłączenie przez serwer po ~30 s.
+    """
+    return bytes([0x06]) + ping_raw[1:]
+
 # ─────────────────────────────────────────────────────────────────
-# CBOR
+# CBOR — DEKODOWANIE
 # ─────────────────────────────────────────────────────────────────
 
 def cbor_decode_all(data: bytes) -> list:
+    """
+    Dekoduje wszystkie wartości CBOR z ciągu bajtów.
+    Jeden payload Diffusion może zawierać wiele połączonych wartości CBOR.
+    Ręcznie przesuwamy pozycję strumienia i pomijamy jeden bajt przy
+    błędach dekodowania, żeby utrzymać synchronizację.
+    """
     results = []
     stream  = io.BytesIO(data)
     decoder = cbor2.CBORDecoder(stream)
@@ -100,6 +215,7 @@ def cbor_decode_all(data: bytes) -> list:
 
 
 def collect_strings(obj) -> list:
+    """Rekurencyjnie zbiera wszystkie wartości stringowe z obiektu CBOR."""
     out = []
     if isinstance(obj, str):
         out.append(obj)
@@ -114,6 +230,10 @@ def collect_strings(obj) -> list:
 
 
 def deep_find(obj, key: str):
+    """
+    Rekurencyjnie przeszukuje zdekodowany obiekt CBOR w poszukiwaniu
+    pierwszego wystąpienia podanego klucza. Zwraca wartość lub None.
+    """
     if isinstance(obj, dict):
         if key in obj:
             return obj[key]
@@ -129,10 +249,71 @@ def deep_find(obj, key: str):
     return None
 
 # ─────────────────────────────────────────────────────────────────
-# PARSOWANIE EVENTU
+# PARSOWANIE NAZW DRUŻYN
+# ─────────────────────────────────────────────────────────────────
+
+def extract_team_names(raw: bytes) -> tuple[str, str]:
+    """
+    Wyciąga nazwy drużyny gospodarza i gości z ramki snapshot (0x04).
+
+    Payload CBOR może zaczynać się na różnych offsetach bajtowych
+    w zależności od liczby bajtów nagłówka Diffusion — próbujemy
+    offsetów 0–6.
+
+    Priorytety źródeł nazw:
+      1. Pole "name" zawierające separator " vs "  →  "Gospodarz vs Gość"
+      2. homeTeam.name / awayTeam.name
+      3. homeName / awayName
+      4. Fallback: dowolny string zawierający " vs "
+    """
+    for offset in (2, 4, 6, 1, 0):
+        if offset >= len(raw):
+            continue
+        try:
+            values = cbor_decode_all(raw[offset:])
+        except Exception:
+            continue
+        for v in values:
+            name = deep_find(v, "name")
+            if isinstance(name, str) and " vs " in name:
+                parts = name.split(" vs ", 1)
+                return parts[0].strip(), parts[1].strip()
+            home_obj = deep_find(v, "homeTeam")
+            away_obj = deep_find(v, "awayTeam")
+            if home_obj and away_obj:
+                h = deep_find(home_obj, "name") if isinstance(home_obj, dict) else None
+                a = deep_find(away_obj, "name") if isinstance(away_obj, dict) else None
+                if isinstance(h, str) and isinstance(a, str) and h and a:
+                    return h, a
+            h = deep_find(v, "homeName")
+            a = deep_find(v, "awayName")
+            if isinstance(h, str) and isinstance(a, str) and h and a:
+                return h, a
+    # Fallback — skanuj wszystkie stringi
+    try:
+        for offset in (2, 4, 6):
+            values = cbor_decode_all(raw[offset:])
+            strings = []
+            for v in values:
+                strings += collect_strings(v)
+            for s in strings:
+                if " vs " in s and 5 < len(s) < 100:
+                    parts = s.split(" vs ", 1)
+                    return parts[0].strip(), parts[1].strip()
+    except Exception:
+        pass
+    return "", ""
+
+# ─────────────────────────────────────────────────────────────────
+# PARSOWANIE EVENTU (ramka 0x05 / 0x06)
 # ─────────────────────────────────────────────────────────────────
 
 def find_in_bytes(data: bytes, targets: list[str]) -> str | None:
+    """
+    Skanuje surowe bajty w poszukiwaniu pierwszego pasującego ciągu ASCII
+    z listy targets. Próbuje też dopasowania 5-bajtowego prefiksu dla
+    dłuższych stringów, żeby obsłużyć payloady z obciętymi ciągami.
+    """
     for target in targets:
         if target.encode("ascii") in data:
             return target
@@ -144,6 +325,10 @@ def find_in_bytes(data: bytes, targets: list[str]) -> str | None:
 
 
 def ascii_runs(payload: bytes, min_len: int = 3) -> list[str]:
+    """
+    Wyciąga wszystkie ciągi drukowalnych znaków ASCII o długości
+    co najmniej min_len. Używane do debugowania nierozpoznanych ramek.
+    """
     runs, i = [], 0
     while i < len(payload):
         j = i
@@ -156,8 +341,31 @@ def ascii_runs(payload: bytes, min_len: int = 3) -> list[str]:
 
 
 def parse_event(raw: bytes) -> dict:
+    """
+    Parsuje event meczowy z ramki delta (0x05 lub 0x06).
+
+    Payload zaczyna się od bajtu 6 (po nagłówku ramki Diffusion).
+
+    Strategia:
+      1. Próba dekodowania CBOR — szukamy kluczy "teamType" i "type".
+         Wartości teamType: HOME, AWAY, MATCH (MATCH = event całego meczu)
+      2. Fallback do skanowania surowych bajtów:
+         a. Szukamy znanych wielobajtowych sekwencji markerów HOME/AWAY.
+         b. Sprawdzamy bajt przed stringiem typu eventu: 0x48 (H) → HOME,
+            0x41 (A) → AWAY — kodowanie jednobajtowego stringu CBOR.
+         c. Ostateczność: obecność b"HOM" lub b"AWA" gdziekolwiek.
+
+    Zwraca słownik z:
+      event_type    – dopasowany typ eventu lub None
+      team          – "HOME", "AWAY" lub None
+      team_source   – jak określono drużynę (do debugowania)
+      cbor_*        – surowe wyniki parsowania CBOR
+      byte_*        – surowe wyniki skanowania bajtów
+      debug_strings – drukowalne ciągi ASCII z payloadu
+    """
     payload = raw[6:]
 
+    # ── Ścieżka CBOR ────────────────────────────────────────────
     cbor_team  = None
     cbor_etype = None
     try:
@@ -180,11 +388,13 @@ def parse_event(raw: bytes) -> dict:
     except Exception:
         pass
 
+    # ── Fallback skanowania bajtów ───────────────────────────────
     byte_etype = find_in_bytes(payload, EVENT_TYPES_LIST)
     byte_team  = None
     byte_tdbg  = "-"
 
     if not cbor_team:
+        # Znane wielobajtowe markery drużyn pojawiające się dosłownie w payloadach
         for marker, team in [
             (b"HOME",   "HOME"), (b"AWAY",   "AWAY"),
             (b"DHOME",  "HOME"), (b"DAWAY",  "AWAY"),
@@ -199,6 +409,7 @@ def parse_event(raw: bytes) -> dict:
                 byte_tdbg = marker.decode()
                 break
 
+        # Sprawdź bajt przed stringiem typu eventu
         if not byte_team:
             for etype in EVENT_TYPES_LIST:
                 fragment  = etype.encode("ascii")[:max(4, len(etype)-2)]
@@ -212,6 +423,7 @@ def parse_event(raw: bytes) -> dict:
                 if team_byte == 0x41 and 0x40 <= pre <= 0x7F:
                     byte_team = "AWAY"; byte_tdbg = "pre-A"; break
 
+        # Ostateczność
         if not byte_team:
             if b"HOM" in payload:   byte_team = "HOME"; byte_tdbg = "HOM"
             elif b"AWA" in payload: byte_team = "AWAY"; byte_tdbg = "AWA"
@@ -232,10 +444,15 @@ def parse_event(raw: bytes) -> dict:
     }
 
 # ─────────────────────────────────────────────────────────────────
-# PARSOWANIE STANU MECZU
+# PARSOWANIE STANU MECZU (ramka 0x04)
 # ─────────────────────────────────────────────────────────────────
 
 def parse_match_state(raw: bytes) -> dict:
+    """
+    Parsuje snapshot stanu meczu (ramka 0x04).
+    Wyciąga: nazwę meczu, sport, okres, wynik, flagę tykania zegara
+    oraz statystyki per drużyna (strzały, rzuty rożne, ataki, auty).
+    """
     state  = {}
     values = cbor_decode_all(raw[2:])
     strings = []
@@ -312,10 +529,11 @@ def parse_match_state(raw: bytes) -> dict:
     return state
 
 # ─────────────────────────────────────────────────────────────────
-# HEXDUMP
+# HEXDUMP (debug)
 # ─────────────────────────────────────────────────────────────────
 
 def hexdump(raw: bytes, width: int = 16) -> str:
+    """Klasyczny dump hex+ASCII, używany dla nierozpoznanych ramek."""
     lines = []
     for i in range(0, len(raw), width):
         chunk   = raw[i:i + width]
@@ -328,48 +546,55 @@ def hexdump(raw: bytes, width: int = 16) -> str:
 # WYŚWIETLANIE
 # ─────────────────────────────────────────────────────────────────
 
-def print_match_state(state: dict):
-    print(f"  Match  : {state.get('match', '?')}")
-    print(f"  Sport  : {state.get('sport', '?')}")
-    print(f"  Period : {state.get('period', '?')}")
-    score = state.get("score", {})
-    if score:
-        print(f"  Score  : {score.get('home','?')} - {score.get('away','?')}")
-    ticking = state.get("clock_ticking")
-    if ticking is not None:
-        print(f"  Clock  : {'running' if ticking else 'stopped'}")
-    stats = state.get("stats", {})
-    if stats:
-        print("  Stats  :")
-        for key, lbl in [
-            ("shots_on",   "Shots on target "),
-            ("shots_off",  "Shots off target"),
-            ("corners",    "Corners         "),
-            ("attacks",    "Attacks         "),
-            ("goal_kicks", "Goal kicks      "),
-        ]:
-            if key in stats:
-                h = stats[key].get("home", "?")
-                a = stats[key].get("away", "?")
-                print(f"    {lbl}: {h} - {a}")
+def print_header(event_id: str, home_name: str, away_name: str):
+    """Drukuje nagłówek tabeli — raz na sesję (lub po reconneccie)."""
+    h = home_name if home_name else "Home"
+    a = away_name if away_name else "Away"
+    print("─" * 60)
+    print(f"  OB_EV{event_id}  |  {h} vs {a}")
+    print("─" * 60)
+    print(f"  {'TIME':8}  {'TEAM':<{COL_TEAM_WIDTH}}EVENT")
+    print("─" * 60)
+
+
+def print_system_line(now_s: str, msg: str):
+    """
+    Linia systemowa (reconnect, błąd, koniec meczu) wyrównana
+    do kolumny EVENT — identyczny format jak zwykłe eventy,
+    ale z '~' w kolumnie drużyny żeby łatwo odróżnić.
+    """
+    print(f"  {now_s}  {'~':<{COL_TEAM_WIDTH}}{msg}")
+
+
+def resolve_team(team: str | None, home_name: str, away_name: str) -> str:
+    """Zamienia HOME/AWAY na nazwę drużyny, jeśli jest znana."""
+    if team == "HOME" and home_name:
+        return home_name
+    if team == "AWAY" and away_name:
+        return away_name
+    return team if team else "???"
 
 
 def print_event_line(
     now_s: str,
     etype: str | None,
     team: str | None,
-    team_source: str,
+    home_name: str,
+    away_name: str,
     info: dict,
     raw: bytes,
 ):
+    """
+    Drukuje jedną linię eventu w tabeli.
+    Eventy bez drużyny (NO_TEAM_EVENTS) mają pustą kolumnę TEAM.
+    Nierozpoznane eventy lub eventy bez drużyny dostają blok debug
+    z hexdumpem payloadu.
+    """
     no_team    = etype in NO_TEAM_EVENTS
-    team_disp  = team  if team  else "???"
+    team_disp  = "" if no_team else resolve_team(team, home_name, away_name)
     etype_disp = etype if etype else "UNKNOWN"
 
-    if no_team:
-        print(f"  {now_s}        {etype_disp}")
-    else:
-        print(f"  {now_s}  {team_disp:<4}  {etype_disp}")
+    print(f"  {now_s}  {team_disp:<{COL_TEAM_WIDTH}}{etype_disp}")
 
     missing_team = not no_team and not team
     unknown_evt  = not etype
@@ -387,6 +612,10 @@ def print_event_line(
 # ─────────────────────────────────────────────────────────────────
 
 async def keepalive(ws):
+    """
+    Wysyła ramkę keepalive co 20 s żeby podtrzymać połączenie.
+    Uruchamiane jako osobny task asyncio.
+    """
     try:
         while True:
             await asyncio.sleep(20)
@@ -399,20 +628,42 @@ async def keepalive(ws):
 # ─────────────────────────────────────────────────────────────────
 
 async def listen(event_id: str):
+    """
+    Główna pętla nasłuchiwania eventów meczowych.
+
+    Przepływ:
+      1. Połącz się z WebSocket i wyślij handshake Diffusion.
+      2. Zasubskrybuj dwa tematy: główny stan meczu + incydenty.
+      3. Odbieraj ramki i dispatch według bajtu typu:
+           0x00 → pong (obowiązkowy, inaczej serwer rozłączy)
+           0x04 → snapshot: wyciągnij nazwy drużyn, wydrukuj nagłówek
+           0x05 → delta: parsuj event, deduplikuj, wydrukuj
+           0x06 → keepalive/delta: jak 0x05 ale krótsza forma
+      4. Przy rozłączeniu: czekaj 3 s i połącz ponownie.
+      5. Przy evencie kończącym mecz: wydrukuj MATCH FINISHED i zakończ.
+
+    Zmienne stanu (poza pętlą reconnect):
+      home_name / away_name   – nazwy drużyn (z pierwszego snapshotu)
+      last_team / last_team_ts – ostatnio widziana drużyna + timestamp,
+                                 używane do przypisania drużyny eventom
+                                 bez teamType w oknie 30 s
+      last_clock_event        – do deduplikacji eventów zegarowych
+      header_printed          – flaga czy nagłówek tabeli już wydrukowany
+      game_over               – flaga końca meczu
+    """
     ssl_ctx   = ssl.create_default_context()
     game_over = False
 
-    last_team:    str | None      = None
-    last_team_ts: datetime | None = None
+    last_team:        str | None      = None
+    last_team_ts:     datetime | None = None
+    last_clock_event: str             = ""
+
+    home_name:      str  = ""
+    away_name:      str  = ""
+    header_printed: bool = False
 
     topic_main      = f"scoreboards/v1/OB_EV{event_id}"
     topic_incidents = f"scoreboards/v1/OB_EV{event_id}/incidents"
-
-    print("=" * 55)
-    print(f"  William Hill — Live Scoreboard")
-    print(f"  Match : OB_EV{event_id}")
-    print(f"  Start : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 55)
 
     while True:
         try:
@@ -420,24 +671,18 @@ async def listen(event_id: str):
                 WS_URL,
                 additional_headers=HEADERS,
                 ssl=ssl_ctx,
-                ping_interval=None,
-                ping_timeout=None,
+                ping_interval=None,   # wyłączamy wbudowany ping websockets —
+                ping_timeout=None,    # obsługujemy pingi Diffusion sami (0x00→0x06)
                 max_size=10 * 1024 * 1024,
                 close_timeout=5,
             ) as ws:
-                print("[✓] Connected\n")
+                # Handshake Diffusion — musi być przed subskrypcjami
                 await ws.send(base64.b64decode(HANDSHAKE_B64))
                 await ws.recv()
-                print("[✓] Handshake OK\n")
 
-                # Subskrybuj oba tematy
+                # Subskrybuj oba tematy jednocześnie
                 await ws.send(make_subscribe(topic_main))
                 await ws.send(make_subscribe(topic_incidents))
-                print(f"[✓] Subscribed: {topic_main}")
-                print(f"[✓] Subscribed: {topic_incidents}\n")
-                print("═" * 55)
-                print(f"  {'TIME':8}  {'TEAM':<4}  EVENT")
-                print("─" * 45)
 
                 ping_task = asyncio.create_task(keepalive(ws))
                 try:
@@ -447,65 +692,113 @@ async def listen(event_id: str):
                         now   = datetime.now()
                         now_s = now.strftime("%H:%M:%S")
 
+                        # ── Ping serwera → obowiązkowy pong ─────────────
+                        if ftype == 0x00:
+                            await ws.send(make_pong(raw))
+                            continue
+
+                        # ── Handshake ACK → echo ─────────────────────────
                         if ftype == 0x01:
                             await ws.send(raw)
                             continue
+
+                        # ── Subscribe / unsubscribe ACK → ignoruj ────────
                         if ftype in (0x02, 0x03):
                             continue
+
+                        # ── Ramka epoch keepalive → ignoruj ──────────────
                         if ftype == 0x06 and (b"epoch" in raw or len(raw) <= 6):
                             continue
 
+                        # ── Snapshot (pełny stan meczu) ───────────────────
                         if ftype == 0x04:
-                            # Ignoruj MATCH STATE z /incidents (za dużo szumu)
-                            if topic_incidents.encode() not in raw:
-                                print()
-                                print_match_state(parse_match_state(raw))
-                                print("─" * 45)
-                                print(f"  {'TIME':8}  {'TEAM':<4}  EVENT")
-                                print("─" * 45)
+                            # Wyciągnij nazwy drużyn z pierwszego snapshotu
+                            if not home_name:
+                                h, a = extract_team_names(raw)
+                                if h and a:
+                                    home_name = h
+                                    away_name = a
 
+                            # Drukuj nagłówek gdy tylko poznamy nazwy drużyn
+                            if not header_printed and home_name:
+                                print_header(event_id, home_name, away_name)
+                                header_printed = True
+
+                        # ── Delta (event meczowy) ─────────────────────────
                         elif ftype == 0x05:
+                            # Drukuj nagłówek jeśli jeszcze nie (edge case)
+                            if not header_printed:
+                                print_header(event_id, home_name, away_name)
+                                header_printed = True
+
                             info  = parse_event(raw)
                             etype = info.get("event_type")
 
-                            if not etype and len(raw) <= 45:
+                            # Pomiń ramki bez etype i bez drużyny —
+                            # to delta pozycji/pędu bez wartości wyświetleniowej
+                            if not etype and not info.get("team"):
                                 continue
+
+                            # Ramka z drużyną ale bez etype → aktualizacja statystyk
+                            if not etype and info.get("team"):
+                                etype = "STAT_UPDATE"
+
+                            # Deduplikacja eventów zegarowych
+                            if etype in CLOCK_EVENTS:
+                                if etype == last_clock_event:
+                                    continue
+                                last_clock_event = etype
 
                             if etype in GAME_OVER_EVENTS:
                                 game_over = True
 
+                            # Zaktualizuj ostatnio widzianą drużynę
                             if info.get("team"):
                                 last_team    = info["team"]
                                 last_team_ts = now
 
-                            team        = info.get("team")
-                            team_source = info.get("team_source", "-")
+                            # Jeśli brak drużyny — próbuj z kontekstu (okno 30 s)
+                            team = info.get("team")
                             if not team and etype and etype not in NO_TEAM_EVENTS:
                                 age = (now - last_team_ts).total_seconds() if last_team_ts else 999
                                 if last_team and age < 30:
-                                    team        = last_team
-                                    team_source = f"ctx,{age:.1f}s"
+                                    team = last_team
 
-                            print_event_line(now_s, etype, team, team_source, info, raw)
+                            print_event_line(now_s, etype, team, home_name, away_name, info, raw)
 
+                            if game_over:
+                                print_system_line(now_s, f"KONIEC MECZU  {home_name} vs {away_name}")
+                                return
+
+                        # ── Delta w skróconej formie ──────────────────────
                         elif ftype == 0x06:
+                            if not header_printed:
+                                continue  # poczekaj na snapshot
+
                             info  = parse_event(raw)
                             etype = info.get("event_type")
-                            if etype:
-                                team        = info.get("team")
-                                team_source = info.get("team_source", "-")
-                                if not team and etype not in NO_TEAM_EVENTS:
-                                    age = (now - last_team_ts).total_seconds() if last_team_ts else 999
-                                    if last_team and age < 30:
-                                        team        = last_team
-                                        team_source = f"ctx,{age:.1f}s"
-                                print_event_line(now_s, etype, team, team_source, info, raw)
+                            if not etype:
+                                continue
 
-                        elif ftype == 0x00 and len(raw) > 10:
-                            text  = raw.decode("utf-8", errors="replace")
-                            clean = re.sub(r'[^\x20-\x7E]', ' ', text)
-                            print(f"\n  [{re.sub(' +', ' ', clean).strip()[:80]}]")
-                            print("─" * 45)
+                            if etype in CLOCK_EVENTS:
+                                if etype == last_clock_event:
+                                    continue
+                                last_clock_event = etype
+
+                            if etype in GAME_OVER_EVENTS:
+                                game_over = True
+
+                            team = info.get("team")
+                            if not team and etype not in NO_TEAM_EVENTS:
+                                age = (now - last_team_ts).total_seconds() if last_team_ts else 999
+                                if last_team and age < 30:
+                                    team = last_team
+
+                            print_event_line(now_s, etype, team, home_name, away_name, info, raw)
+
+                            if game_over:
+                                print_system_line(now_s, f"KONIEC MECZU  {home_name} vs {away_name}")
+                                return
 
                 finally:
                     ping_task.cancel()
@@ -514,33 +807,47 @@ async def listen(event_id: str):
                     except asyncio.CancelledError:
                         pass
 
-        except websockets.exceptions.ConnectionClosedError as e:
+        except websockets.exceptions.ConnectionClosedError:
             if game_over:
-                print(f"\n[✓] Match finished.")
                 return
-            print(f"\n[!] Reconnecting in 3s... ({e})")
+            now_s = datetime.now().strftime("%H:%M:%S")
+            if header_printed:
+                print_system_line(now_s, "RECONNECTING...")
             await asyncio.sleep(3)
+            if header_printed:
+                print_system_line(datetime.now().strftime("%H:%M:%S"), "RECONNECTED")
+
         except websockets.exceptions.WebSocketException as e:
             if game_over:
-                print(f"\n[✓] Match finished.")
                 return
-            print(f"\n[!] Reconnecting in 3s... ({e})")
+            now_s = datetime.now().strftime("%H:%M:%S")
+            if header_printed:
+                print_system_line(now_s, f"RECONNECTING...  ({type(e).__name__})")
             await asyncio.sleep(3)
+
         except Exception as e:
-            print(f"\n[!] Error: {type(e).__name__}: {e}")
-            print("[~] Reconnecting in 5s...")
+            now_s = datetime.now().strftime("%H:%M:%S")
+            if header_printed:
+                print_system_line(now_s, f"BŁĄD  {type(e).__name__}: {e}")
             await asyncio.sleep(5)
 
 
+# ──────────────────────────────────────────────────────���──────────
+# PUNKT WEJŚCIA
+# ─────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="William Hill Live Scoreboard")
+    parser = argparse.ArgumentParser(
+        description="William Hill Live Scoreboard — odbiera eventy meczowe w czasie rzeczywistym.",
+        epilog="Przykład: python williamhill_scoreboard.py 39319952",
+    )
     parser.add_argument(
         "event_id",
-        help="Event ID, np. 39319952",
+        help="Identyfikator meczu z URL William Hill, np. 39319952",
     )
     args = parser.parse_args()
 
     try:
         asyncio.run(listen(args.event_id))
     except KeyboardInterrupt:
-        print("\n[✓] Stopped.")
+        print("\n[✓] Zatrzymano.")
