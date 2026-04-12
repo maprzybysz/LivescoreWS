@@ -206,6 +206,9 @@ GAME_OVER_EVENTS = {
 CLOCK_EVENTS = {
     "FIRST_HALF", "SECOND_HALF", "HALF_TIME", "FULL_TIME",
     "EXTRA_TIME_FIRST_HALF", "EXTRA_TIME_SECOND_HALF",
+    "FIRST_HALF_KICK_OFF", "SECOND_HALF_KICK_OFF",
+    "EXTRA_TIME_KICK_OFF", "START_PENALTY_SHOOTOUT",
+    "START_1_ST_HALF", "START_2_ND_HALF",
 }
 
 # Szerokość kolumny TEAM w tabeli wyjściowej.
@@ -397,9 +400,12 @@ def find_in_bytes(data: bytes, targets: list[str]) -> str | None:
     z listy targets. Próbuje też dopasowania 5-bajtowego prefiksu dla
     dłuższych stringów, żeby obsłużyć payloady z obciętymi ciągami.
     """
+    # Najpierw tylko pełne dopasowania
     for target in targets:
         if target.encode("ascii") in data:
             return target
+    # Dopiero potem prefiksy (fallback)
+    for target in targets:
         if len(target) > 5:
             fragment = target.encode("ascii")[:5]
             if fragment in data:
@@ -447,11 +453,9 @@ def parse_event(raw: bytes) -> dict:
       debug_strings – drukowalne ciągi ASCII z payloadu
     """
     payload = raw[6:]
-
-    # ── Ścieżka CBOR ────────────────────────────────────────────
-    cbor_team      = None
-    cbor_etype     = None
-    duration_secs  = None
+    cbor_team = None
+    cbor_etype = None
+    duration_secs = None
     try:
         values = cbor_decode_all(payload)
         for v in values:
@@ -470,18 +474,27 @@ def parse_event(raw: bytes) -> dict:
                     cbor_etype = e.upper()
                     break
 
-        # Wyciągnij czas meczu z pola incident.time.duration
+        # Szukaj czasu meczu — kilka możliwych lokalizacji w CBOR
         for v in values:
+            # Wariant 1: incident.time.duration
             time_obj = deep_find(v, "time")
             if isinstance(time_obj, dict):
                 d = time_obj.get("duration")
                 if isinstance(d, int) and d >= 0:
                     duration_secs = d
                     break
-            # Fallback: szukaj klucza "duration" bezpośrednio
+            # Wariant 2: klucz "duration" bezpośrednio na poziomie incydentu
             d = deep_find(v, "duration")
-            if isinstance(d, int) and 0 <= d < 10000:
+            if isinstance(d, int) and 0 <= d < 18000:  # max 5h w sekundach
                 duration_secs = d
+                break
+            # Wariant 3: clockTime lub matchTime
+            for key in ("clockTime", "matchTime", "elapsedTime"):
+                d = deep_find(v, key)
+                if isinstance(d, int) and 0 <= d < 18000:
+                    duration_secs = d
+                    break
+            if duration_secs is not None:
                 break
     except Exception:
         pass
