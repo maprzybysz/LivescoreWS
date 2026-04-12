@@ -8,11 +8,20 @@ Przegląd protokołu
 Strona używa Diffusion — własnościowego protokołu pub/sub po WebSocket.
 Wszystkie wiadomości to ramki binarne z 1-bajtowym prefiksem typu:
 
-  0x00  Ping od serwera   → musimy odpowiedzieć pongiem 0x06 (ten sam
-                            payload, pierwszy bajt zmieniony na 0x06).
-                            Brak odpowiedzi powoduje zamknięcie połączenia
-                            przez serwer po ~30 s — to jest źródło
-                            reconnectów widocznych w logach.
+  0x00  SERVICE_REQUEST od serwera → musimy odpowiedzieć SERVICE_RESPONSE
+                            (0x06) z tym samym payloadem.  Brak odpowiedzi
+                            powoduje zamknięcie połączenia przez serwer po
+                            ~30 s (dokładnie: systemPingPeriod × 2 ms) —
+                            to jest główna przyczyna reconnectów.
+
+                            Szczególny przypadek: service_id == 55 to
+                            SYSTEM_PING (service_id == 56 to USER_PING).
+                            Format ramki SERVICE_REQUEST:
+                              byte[0] = 0x00  (typ SERVICE_REQUEST)
+                              byte[1] = conversation_id (varint)
+                              byte[2] = service_id (varint, 55 = SYSTEM_PING)
+                            Odpowiedź SERVICE_RESPONSE:
+                              byte[0] = 0x06, reszta payloadu bez zmian.
   0x01  Topic load ACK    → odsyłamy bez zmian (handshake protokołu)
   0x02  Subscribe ACK     → ignorujemy
   0x03  Unsubscribe ACK   → ignorujemy
@@ -48,6 +57,12 @@ Ramki bez typu eventu i bez drużyny są ciche odrzucane — to delta
 pozycji/pędu bez wartości wyświetleniowej.
 Ramki z drużyną ale bez typu eventu pokazywane są jako STAT_UPDATE.
 
+Minuta meczu
+────────────
+Każdy incydent zawiera pole incident.time.duration (sekundy od początku
+meczu).  Przeliczamy na minutę meczu: minuta = sekundy // 60 + 1.
+Minutę wyświetlamy w kolumnie MIN między TEAM a EVENT.
+
 Deduplikacja
 ────────────
 Eventy zegarowe (FIRST_HALF, SECOND_HALF itp.) przychodzą jako
@@ -60,6 +75,12 @@ Serwer zamyka połączenie co kilka minut. Automatycznie się
 łączymy ponownie i pokazujemy linię RECONNECTING / RECONNECTED
 w tabeli eventów. Po reconneccie serwer wysyła ponownie pełny
 snapshot, więc nazwy drużyn i aktualny stan meczu są zawsze świeże.
+
+Tryb debug
+──────────
+Uruchom z flagą --debug żeby zobaczyć dodatkowe informacje: odebrane
+SYSTEM_PING, identyfikatory conversation/service oraz ramki których
+nie udało się rozpoznać.
 """
 
 import asyncio
@@ -72,6 +93,13 @@ from datetime import datetime
 
 import cbor2
 import websockets
+
+# ─────────────────────────────────────────────────────────────────
+# TRYB DEBUG
+# ─────────────────────────────────────────────────────────────────
+
+# Ustawiane przez argparse przy starcie — nie zmieniaj ręcznie.
+DEBUG: bool = False
 
 # ─────────────────────────────────────────────────────────────────
 # KONFIGURACJA
@@ -119,17 +147,32 @@ PERIOD_LABELS = {
 # bajtów dopasowuje wtedy najbardziej szczegółowy ciąg jako pierwszy
 # (np. DANGEROUS_FREE_KICK przed FREE_KICK).
 EVENT_TYPES_LIST = sorted([
-    "GOAL", "YELLOW", "RED_CARD",
+    "GOAL", "YELLOW", "YELLOW_CARD", "RED_CARD",
     "FREE_KICK", "DANGEROUS_FREE_KICK",
     "CORNER", "GOAL_KICK", "THROW_IN", "PENALTY", "KICK_OFF",
     "SHOT_ON_TARGET", "SHOT_OFF_TARGET", "SHOT_BLOCKED",
+    "BLOCKED_SHOT", "SHOT_WOODWORK",
     "DANGEROUS_ATTACK", "ATTACK", "SAFE", "BALL_SAFE", "CLEARANCE",
     "FDANGER", "DANGER",
     "OFFSIDE", "SUBSTITUTION",
+    "FOUL",
+    "PENALTY_MISSED", "PENALTY_RETAKEN",
     "GAME_FINISHED", "STOP_GAME",
     "HALF_TIME", "FULL_TIME",
     "STOP_1_ST_HALF", "STOP_2_ND_HALF",
     "FIRST_HALF", "SECOND_HALF",
+    # Eventy dogrywki
+    "EXTRA_TIME_FIRST_HALF", "EXTRA_TIME_SECOND_HALF",
+    "EXTRA_TIME_HALF_TIME", "EXTRA_TIME_KICK_OFF",
+    "STOP_1_ST_HALF_OF_EXTRA_TIME", "STOP_2_ND_HALF_OF_EXTRA_TIME",
+    "END_OF_EXTRA_TIME",
+    # Strzały startowe poszczególnych połówek
+    "FIRST_HALF_KICK_OFF", "SECOND_HALF_KICK_OFF",
+    # Sygnały startu/stopu okresu
+    "START_1_ST_HALF", "START_2_ND_HALF",
+    "START_PENALTY_SHOOTOUT",
+    # Koniec meczu
+    "END_OF_MATCH",
 ], key=len, reverse=True)
 
 # Eventy dotyczące całego meczu, nie konkretnej drużyny.
@@ -139,17 +182,31 @@ NO_TEAM_EVENTS = {
     "STOP_1_ST_HALF", "STOP_2_ND_HALF",
     "FIRST_HALF", "SECOND_HALF",
     "BALL_SAFE",
+    # Eventy dogrywki i strzały startowe
+    "EXTRA_TIME_FIRST_HALF", "EXTRA_TIME_SECOND_HALF",
+    "EXTRA_TIME_HALF_TIME", "EXTRA_TIME_KICK_OFF",
+    "FIRST_HALF_KICK_OFF", "SECOND_HALF_KICK_OFF",
+    "START_1_ST_HALF", "START_2_ND_HALF",
+    "START_PENALTY_SHOOTOUT",
+    "STOP_1_ST_HALF_OF_EXTRA_TIME", "STOP_2_ND_HALF_OF_EXTRA_TIME",
+    "END_OF_EXTRA_TIME", "END_OF_MATCH",
 }
 
 # Otrzymanie któregokolwiek z tych eventów oznacza koniec meczu.
 # STOP_2_ND_HALF to sygnał końca drugiej połowy używany w niektórych
 # ligach zamiast FULL_TIME / GAME_FINISHED.
-GAME_OVER_EVENTS = {"GAME_FINISHED", "STOP_GAME", "FULL_TIME", "STOP_2_ND_HALF"}
+GAME_OVER_EVENTS = {
+    "GAME_FINISHED", "STOP_GAME", "FULL_TIME", "STOP_2_ND_HALF",
+    "END_OF_MATCH",
+}
 
 # Eventy zegarowe przychodzą jako ciągły strumień identycznych delt
 # podczas gdy zegar tyka. Deduplikujemy — wyświetlamy tylko raz
 # przy każdej zmianie okresu.
-CLOCK_EVENTS = {"FIRST_HALF", "SECOND_HALF", "HALF_TIME", "FULL_TIME"}
+CLOCK_EVENTS = {
+    "FIRST_HALF", "SECOND_HALF", "HALF_TIME", "FULL_TIME",
+    "EXTRA_TIME_FIRST_HALF", "EXTRA_TIME_SECOND_HALF",
+}
 
 # Szerokość kolumny TEAM w tabeli wyjściowej.
 COL_TEAM_WIDTH = 22
@@ -182,11 +239,37 @@ def make_keepalive() -> bytes:
 
 def make_pong(ping_raw: bytes) -> bytes:
     """
-    Odpowiedź na ping serwera (ramka 0x00).
-    Pong jest identyczny z pingiem, ale z pierwszym bajtem zmienionym
-    na 0x06. Brak odpowiedzi powoduje rozłączenie przez serwer po ~30 s.
+    Buduje odpowiedź SERVICE_RESPONSE (0x06) na SERVICE_REQUEST (0x00) serwera.
+
+    Format SERVICE_REQUEST:
+      byte[0] = 0x00  (typ SERVICE_REQUEST)
+      byte[1] = conversation_id (varint)
+      byte[2] = service_id (varint) — 55 dla SYSTEM_PING, 56 dla USER_PING
+
+    Odpowiedź SERVICE_RESPONSE ma identyczny payload, z pierwszym bajtem
+    zmienionym z 0x00 na 0x06 — conversation_id i service_id pozostają
+    bez zmian, dzięki czemu serwer może dopasować odpowiedź do żądania.
+
+    Brak odpowiedzi na SYSTEM_PING powoduje rozłączenie przez serwer po
+    systemPingPeriod × 2 ms (zwykle kilka minut) — to jest główna
+    przyczyna reconnectów widocznych w logach.
     """
     return bytes([0x06]) + ping_raw[1:]
+
+
+# ─────────────────────────────────────────────────────────────────
+# CZAS MECZU
+# ─────────────────────────────────────────────────────────────────
+
+def duration_to_minute(secs: int | None) -> str:
+    """
+    Przelicza czas trwania meczu (sekundy od początku okresu) na minutę.
+    Formuła: minuta = sekundy // 60 + 1 (minuty liczymy od 1, nie od 0).
+    Zwraca pusty string gdy brak danych.
+    """
+    if secs is None:
+        return ""
+    return f"{secs // 60 + 1}'"
 
 # ─────────────────────────────────────────────────────────────────
 # CBOR — DEKODOWANIE
@@ -366,8 +449,9 @@ def parse_event(raw: bytes) -> dict:
     payload = raw[6:]
 
     # ── Ścieżka CBOR ────────────────────────────────────────────
-    cbor_team  = None
-    cbor_etype = None
+    cbor_team      = None
+    cbor_etype     = None
+    duration_secs  = None
     try:
         values = cbor_decode_all(payload)
         for v in values:
@@ -385,6 +469,20 @@ def parse_event(raw: bytes) -> dict:
                 if isinstance(e, str):
                     cbor_etype = e.upper()
                     break
+
+        # Wyciągnij czas meczu z pola incident.time.duration
+        for v in values:
+            time_obj = deep_find(v, "time")
+            if isinstance(time_obj, dict):
+                d = time_obj.get("duration")
+                if isinstance(d, int) and d >= 0:
+                    duration_secs = d
+                    break
+            # Fallback: szukaj klucza "duration" bezpośrednio
+            d = deep_find(v, "duration")
+            if isinstance(d, int) and 0 <= d < 10000:
+                duration_secs = d
+                break
     except Exception:
         pass
 
@@ -440,6 +538,7 @@ def parse_event(raw: bytes) -> dict:
         "cbor_etype":    cbor_etype,
         "byte_team":     byte_team,
         "byte_tdbg":     byte_tdbg,
+        "duration_secs": duration_secs,
         "debug_strings": ascii_runs(payload),
     }
 
@@ -553,7 +652,7 @@ def print_header(event_id: str, home_name: str, away_name: str):
     print("─" * 60)
     print(f"  OB_EV{event_id}  |  {h} vs {a}")
     print("─" * 60)
-    print(f"  {'TIME':8}  {'TEAM':<{COL_TEAM_WIDTH}}EVENT")
+    print(f"  {'TIME':8}  {'TEAM':<{COL_TEAM_WIDTH}}{'MIN':<6}EVENT")
     print("─" * 60)
 
 
@@ -562,8 +661,9 @@ def print_system_line(now_s: str, msg: str):
     Linia systemowa (reconnect, błąd, koniec meczu) wyrównana
     do kolumny EVENT — identyczny format jak zwykłe eventy,
     ale z '~' w kolumnie drużyny żeby łatwo odróżnić.
+    Kolumna MIN jest pusta dla linii systemowych.
     """
-    print(f"  {now_s}  {'~':<{COL_TEAM_WIDTH}}{msg}")
+    print(f"  {now_s}  {'~':<{COL_TEAM_WIDTH}}{'':6}{msg}")
 
 
 def resolve_team(team: str | None, home_name: str, away_name: str) -> str:
@@ -587,14 +687,17 @@ def print_event_line(
     """
     Drukuje jedną linię eventu w tabeli.
     Eventy bez drużyny (NO_TEAM_EVENTS) mają pustą kolumnę TEAM.
+    Kolumna MIN pokazuje minutę meczu obliczoną z pola time.duration
+    incydentu (pusta jeśli brak danych).
     Nierozpoznane eventy lub eventy bez drużyny dostają blok debug
     z hexdumpem payloadu.
     """
     no_team    = etype in NO_TEAM_EVENTS
     team_disp  = "" if no_team else resolve_team(team, home_name, away_name)
     etype_disp = etype if etype else "UNKNOWN"
+    min_str    = duration_to_minute(info.get("duration_secs"))
 
-    print(f"  {now_s}  {team_disp:<{COL_TEAM_WIDTH}}{etype_disp}")
+    print(f"  {now_s}  {team_disp:<{COL_TEAM_WIDTH}}{min_str:<6}{etype_disp}")
 
     missing_team = not no_team and not team
     unknown_evt  = not etype
@@ -635,7 +738,9 @@ async def listen(event_id: str):
       1. Połącz się z WebSocket i wyślij handshake Diffusion.
       2. Zasubskrybuj dwa tematy: główny stan meczu + incydenty.
       3. Odbieraj ramki i dispatch według bajtu typu:
-           0x00 → pong (obowiązkowy, inaczej serwer rozłączy)
+           0x00 → SERVICE_RESPONSE (pong) — obowiązkowy, inaczej serwer
+                  rozłączy po ~30 s.  Gdy service_id == 55: SYSTEM_PING
+                  (logowane w trybie debug).
            0x04 → snapshot: wyciągnij nazwy drużyn, wydrukuj nagłówek
            0x05 → delta: parsuj event, deduplikuj, wydrukuj
            0x06 → keepalive/delta: jak 0x05 ale krótsza forma
@@ -692,8 +797,20 @@ async def listen(event_id: str):
                         now   = datetime.now()
                         now_s = now.strftime("%H:%M:%S")
 
-                        # ── Ping serwera → obowiązkowy pong ─────────────
+                        # ── SERVICE_REQUEST serwera → obowiązkowa odpowiedź SERVICE_RESPONSE ──
                         if ftype == 0x00:
+                            # Wykryj SYSTEM_PING (service_id == 55) dla logowania debug.
+                            # Niezależnie od rodzaju pingu odpowiedź jest taka sama:
+                            # bajt[0] zmieniony z 0x00 na 0x06, reszta payloadu bez zmian.
+                            if DEBUG and len(raw) >= 3:
+                                conv_id    = raw[1]
+                                service_id = raw[2]
+                                if service_id == 55:
+                                    print(f"    [DBG] SYSTEM_PING conv={conv_id} svc={service_id} → wysyłam pong")
+                                elif service_id == 56:
+                                    print(f"    [DBG] USER_PING conv={conv_id} svc={service_id} → wysyłam pong")
+                                else:
+                                    print(f"    [DBG] SERVICE_REQUEST conv={conv_id} svc={service_id} → wysyłam pong")
                             await ws.send(make_pong(raw))
                             continue
 
@@ -845,7 +962,15 @@ if __name__ == "__main__":
         "event_id",
         help="Identyfikator meczu z URL William Hill, np. 39319952",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Włącz tryb debug: loguje SYSTEM_PING, USER_PING i nierozpoznane ramki",
+    )
     args = parser.parse_args()
+
+    # Ustaw globalną flagę debug przed uruchomieniem pętli
+    DEBUG = args.debug
 
     try:
         asyncio.run(listen(args.event_id))
