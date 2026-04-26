@@ -102,6 +102,33 @@ import websockets
 DEBUG: bool = False
 
 # ─────────────────────────────────────────────────────────────────
+# ZAPIS RAMEK DO PLIKU
+# ─────────────────────────────────────────────────────────────────
+
+# Gdy ustawione, każda odebrana ramka (przed filtrowaniem) jest dopisywana
+# do tego pliku w formacie hex dump. Ustawiane przez argparse (--frames-log).
+FRAMES_LOG_PATH: str = ""
+
+
+def log_frame(ftype: int, raw: bytes):
+    """Dopisuje ramkę do pliku logów w formacie czytelnym szesnastkowo."""
+    if not FRAMES_LOG_PATH:
+        return
+    try:
+        now_s = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        width = 16
+        with open(FRAMES_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"[{now_s}] ftype=0x{ftype:02x} len={len(raw)}\n")
+            for i in range(0, len(raw), width):
+                chunk   = raw[i:i + width]
+                hex_p   = " ".join(f"{b:02x}" for b in chunk).ljust(width * 3 - 1)
+                ascii_p = "".join(chr(b) if 0x20 <= b <= 0x7E else "." for b in chunk)
+                f.write(f"  {i:04x}  {hex_p}  {ascii_p}\n")
+            f.write("\n")
+    except Exception:
+        pass
+
+# ─────────────────────────────────────────────────────────────────
 # KONFIGURACJA
 # ─────────────────────────────────────────────────────────────────
 
@@ -810,6 +837,9 @@ async def listen(event_id: str):
                         now   = datetime.now()
                         now_s = now.strftime("%H:%M:%S")
 
+                        # Zapisz każdą ramkę do pliku logu (przed filtrowaniem)
+                        log_frame(ftype, raw)
+
                         # ── SERVICE_REQUEST serwera → obowiązkowa odpowiedź SERVICE_RESPONSE ──
                         if ftype == 0x00:
                             # Wykryj SYSTEM_PING (service_id == 55) dla logowania debug.
@@ -829,15 +859,22 @@ async def listen(event_id: str):
 
                         # ── Handshake ACK → echo ─────────────────────────
                         if ftype == 0x01:
+                            if DEBUG:
+                                print(f"    [DBG] Handshake ACK (0x01) len={len(raw)}")
                             await ws.send(raw)
                             continue
 
                         # ── Subscribe / unsubscribe ACK → ignoruj ────────
                         if ftype in (0x02, 0x03):
+                            if DEBUG:
+                                label = "SUBSCRIBE_ACK" if ftype == 0x02 else "UNSUBSCRIBE_ACK"
+                                print(f"    [DBG] {label} (0x{ftype:02x}) len={len(raw)}")
                             continue
 
                         # ── Ramka epoch keepalive → ignoruj ──────────────
                         if ftype == 0x06 and (b"epoch" in raw or len(raw) <= 6):
+                            if DEBUG:
+                                print(f"    [DBG] Epoch keepalive (0x06) len={len(raw)}")
                             continue
 
                         # ── Snapshot (pełny stan meczu) ───────────────────
@@ -930,6 +967,14 @@ async def listen(event_id: str):
                                 print_system_line(now_s, f"KONIEC MECZU  {home_name} vs {away_name}")
                                 return
 
+                        # ── Nieznany typ ramki — wyświetl zawsze ─────────
+                        else:
+                            strings = ascii_runs(raw)
+                            print(f"  {now_s}  {'?':<{COL_TEAM_WIDTH}}{'':6}"
+                                  f"UNKNOWN_FRAME ftype=0x{ftype:02x} len={len(raw)}")
+                            print(f"    ascii={strings}")
+                            print(hexdump(raw))
+
                 finally:
                     ping_task.cancel()
                     try:
@@ -980,10 +1025,19 @@ if __name__ == "__main__":
         action="store_true",
         help="Włącz tryb debug: loguje SYSTEM_PING, USER_PING i nierozpoznane ramki",
     )
+    parser.add_argument(
+        "--frames-log",
+        metavar="PLIK",
+        help=(
+            "Zapisuj wszystkie odebrane ramki (hex dump) do podanego pliku. "
+            "Przykład: --frames-log ramki_39319952.txt"
+        ),
+    )
     args = parser.parse_args()
 
-    # Ustaw globalną flagę debug przed uruchomieniem pętli
+    # Ustaw globalne flagi przed uruchomieniem pętli
     DEBUG = args.debug
+    FRAMES_LOG_PATH = args.frames_log or ""
 
     try:
         asyncio.run(listen(args.event_id))
