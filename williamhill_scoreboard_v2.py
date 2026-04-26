@@ -464,9 +464,19 @@ class DiffusionClient:
         return bytes([0x00, 0x03, 0x02, len(selector)]) + selector
 
     def _make_pong(self, ping_raw: bytes) -> bytes:
+        # SERVICE_RESPONSE: typ=0x06, reszta identyczna jak ping (conversation_id + service_id + payload)
+        # Protokół Diffusion: serwer wysyła 0x00 [conv_id] [svc_id] [...payload]
+        # My odpowiadamy: 0x06 [conv_id] [svc_id] [...payload] — bez zmian poza bajtem typu
         return bytes([0x06]) + ping_raw[1:]
 
+    @staticmethod
+    def _log_conn(msg: str):
+        """Zawsze drukuje zdarzenia połączenia z timestamp — niezależnie od DEBUG."""
+        now_s = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        print(f"  [{now_s}] CONN  {msg}", flush=True)
+
     async def connect_and_run(self, topics: list[str]) -> None:
+        self._log_conn(f"Łączenie z {WS_URL[:60]}...")
         async with websockets.connect(
             WS_URL,
             additional_headers=WS_HEADERS,
@@ -476,11 +486,26 @@ class DiffusionClient:
             max_size=10 * 1024 * 1024,
             close_timeout=5,
         ) as ws:
-            await ws.send(base64.b64decode(HANDSHAKE_B64))
-            await ws.recv()
+            self._log_conn("WebSocket otwarty — wysyłam handshake")
+            handshake = base64.b64decode(HANDSHAKE_B64)
+            await ws.send(handshake)
+            self._log_conn(f"Handshake wysłany ({len(handshake)} bajtów) — czekam na ACK")
+
+            ack = await ws.recv()
+            ack_raw = base64.b64decode(ack) if isinstance(ack, str) else ack
+            self._log_conn(f"Handshake ACK odebrany: ftype=0x{ack_raw[0]:02x} len={len(ack_raw)}")
+            # Handshake ACK (0x01) — odesłać bez zmian
+            if ack_raw and ack_raw[0] == 0x01:
+                await ws.send(ack_raw)
+                self._log_conn("Handshake ACK odesłany (echo)")
 
             for topic in topics:
-                await ws.send(self._make_subscribe(topic))
+                sub = self._make_subscribe(topic)
+                await ws.send(sub)
+                self._log_conn(f"Subskrypcja wysłana: {topic}")
+
+            self._log_conn("Gotowy — nasłuchuję ramek")
+            last_ping_at = datetime.now()
 
             try:
                 async for message in ws:
@@ -488,19 +513,28 @@ class DiffusionClient:
                              if isinstance(message, str) else message)
                     ftype = raw[0] if raw else 0xFF
 
-                    # SERVICE_REQUEST / SUBSCRIBE_REQUEST → obowiązkowa odpowiedź
+                    # SERVICE_REQUEST (ping) → SERVICE_RESPONSE (pong)
                     if ftype == 0x00:
-                        if DEBUG and len(raw) >= 3:
+                        pong = self._make_pong(raw)
+                        await ws.send(pong)
+                        now = datetime.now()
+                        elapsed = (now - last_ping_at).total_seconds()
+                        last_ping_at = now
+                        if len(raw) >= 3:
                             svc = raw[2]
                             label = {55: "SYSTEM_PING", 56: "USER_PING"}.get(
-                                svc, f"SUBSCRIBE_REQ svc={svc} len={len(raw)}")
-                            print(f"    [DBG] {label} conv={raw[1]} → pong")
-                        await ws.send(self._make_pong(raw))
+                                svc, f"SERVICE_REQ svc={svc}")
+                            if DEBUG:
+                                print(f"    [DBG] {label} conv={raw[1]} len={len(raw)}"
+                                      f" → pong ({elapsed:.1f}s od ostatniego)", flush=True)
+                            else:
+                                # Zawsze loguj pingi — kluczowe do diagnostyki rozłączeń
+                                self._log_conn(f"PING {label} → PONG  (odstęp {elapsed:.1f}s)")
                         continue
 
+                    # Handshake ACK (może przyjść ponownie po reconnect)
                     if ftype == 0x01:
-                        if DEBUG:
-                            print(f"    [DBG] Handshake ACK (0x01) len={len(raw)}")
+                        self._log_conn(f"Handshake ACK ponowny (0x01) len={len(raw)} — odsyłam echo")
                         await ws.send(raw)
                         continue
 
@@ -516,8 +550,16 @@ class DiffusionClient:
                         continue
 
                     await self._on_frame(ftype, raw)
+
+            except websockets.exceptions.ConnectionClosed as e:
+                self._log_conn(
+                    f"Połączenie zamknięte: code={e.rcvd.code if e.rcvd else '?'} "
+                    f"reason={e.rcvd.reason if e.rcvd else '?'} "
+                    f"(sent={e.sent})"
+                )
+                raise
             finally:
-                pass
+                self._log_conn("connect_and_run zakończony")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -767,21 +809,32 @@ async def listen(event_id: str):
         try:
             await client.connect_and_run([topic_main, topic_incidents])
 
-        except websockets.exceptions.ConnectionClosedError:
+        except websockets.exceptions.ConnectionClosedError as e:
             if session.game_over:
                 return
-            printer.print_system("RECONNECTING...")
+            code   = e.rcvd.code   if e.rcvd else "?"
+            reason = e.rcvd.reason if e.rcvd else "?"
+            printer.print_system(f"ROZŁĄCZONO  code={code} reason={reason!r}  → reconnect za 3s")
             await asyncio.sleep(3)
-            printer.print_system("RECONNECTED")
+
+        except websockets.exceptions.ConnectionClosedOK:
+            if session.game_over:
+                return
+            printer.print_system("Połączenie zamknięte poprawnie → reconnect za 3s")
+            await asyncio.sleep(3)
 
         except websockets.exceptions.WebSocketException as e:
             if session.game_over:
                 return
-            printer.print_system(f"RECONNECTING...  ({type(e).__name__})")
+            printer.print_system(f"BŁĄD WS  {type(e).__name__}: {e}  → reconnect za 3s")
             await asyncio.sleep(3)
 
+        except OSError as e:
+            printer.print_system(f"BŁĄD SIECI  {e}  → reconnect za 5s")
+            await asyncio.sleep(5)
+
         except Exception as e:
-            printer.print_system(f"BŁĄD  {type(e).__name__}: {e}")
+            printer.print_system(f"BŁĄD  {type(e).__name__}: {e}  → reconnect za 5s")
             await asyncio.sleep(5)
 
         if session.done.is_set():
